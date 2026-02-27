@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -12,37 +12,64 @@ interface ProgressEvent {
   status: string;
 }
 
+interface CompleteEvent {
+  url: string;
+  path: string;
+  hash: string;
+}
+
+interface DownloadFailedEvent {
+  url: string;
+  path: string;
+  error: string;
+}
+
+interface TorStatusEvent {
+  state: string;
+  message: string;
+  daemon_count: number;
+}
+
 interface QueuedItem {
   url: string;
   path: string;
-  status: 'Pending' | 'Active' | 'Complete' | 'Failed';
+  status: "Pending" | "Active" | "Complete" | "Failed";
 }
 
 function App() {
-  // Targets
   const [targetUrls, setTargetUrls] = useState("");
   const [outputDir, setOutputDir] = useState("/tmp/loki_out/");
-
-  // Shared config
   const [connections, setConnections] = useState(150);
   const [forceTor, setForceTor] = useState(false);
 
-  // Engine State
   const [isRunning, setIsRunning] = useState(false);
   const [speed, setSpeed] = useState("0.00");
   const [logs, setLogs] = useState<string[]>([]);
   const [circuits, setCircuits] = useState<Record<number, ProgressEvent>>({});
-
-  // Queue Manger
   const [queue, setQueue] = useState<QueuedItem[]>([]);
+  const [activeQueueIndex, setActiveQueueIndex] = useState<number | null>(null);
+  const [torStatus, setTorStatus] = useState<TorStatusEvent>({
+    state: "idle",
+    message: "Tor inactive until onion links or force mode.",
+    daemon_count: 0,
+  });
 
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const activeQueueIndexRef = useRef<number | null>(null);
+
+  const updateActiveQueueIndex = (index: number | null) => {
+    activeQueueIndexRef.current = index;
+    setActiveQueueIndex(index);
+  };
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
   useEffect(() => {
+    let destroyed = false;
+    const unlisteners: Array<() => void> = [];
+
     const setupListeners = async () => {
       const unlistenProgress = await listen<ProgressEvent>("progress", (e) => {
         setCircuits((prev) => ({
@@ -50,51 +77,131 @@ function App() {
           [e.payload.id]: e.payload,
         }));
       });
+      if (destroyed) {
+        unlistenProgress();
+        return;
+      }
+      unlisteners.push(unlistenProgress);
 
       const unlistenLog = await listen<string>("log", (e) => {
         setLogs((prev) => [...prev, e.payload]);
       });
+      if (destroyed) {
+        unlistenLog();
+        return;
+      }
+      unlisteners.push(unlistenLog);
 
       const unlistenSpeed = await listen<number>("speed", (e) => {
         setSpeed(e.payload.toFixed(2));
       });
+      if (destroyed) {
+        unlistenSpeed();
+        return;
+      }
+      unlisteners.push(unlistenSpeed);
 
-      const unlistenComplete = await listen<string>("complete", (e) => {
-        setLogs((prev) => [...prev, "[!] Integrity Verified: " + e.payload]);
-        // The queue processor effect will pick up the next item when isRunning drops
+      const unlistenTorStatus = await listen<TorStatusEvent>("tor_status", (e) => {
+        setTorStatus(e.payload);
+      });
+      if (destroyed) {
+        unlistenTorStatus();
+        return;
+      }
+      unlisteners.push(unlistenTorStatus);
+
+      const unlistenComplete = await listen<CompleteEvent>("complete", (e) => {
+        setLogs((prev) => [
+          ...prev,
+          `[!] Integrity Verified: ${e.payload.hash}`,
+          `[+] Saved to: ${e.payload.path}`,
+        ]);
+
+        const activeIndex = activeQueueIndexRef.current;
+        if (activeIndex !== null) {
+          setQueue((prev) =>
+            prev.map((q, i) => (i === activeIndex ? { ...q, status: "Complete" } : q)),
+          );
+        } else {
+          setQueue((prev) => {
+            const idx = prev.findIndex((q) => q.path === e.payload.path && q.status === "Active");
+            if (idx < 0) {
+              return prev;
+            }
+            return prev.map((q, i) => (i === idx ? { ...q, status: "Complete" } : q));
+          });
+        }
+
+        updateActiveQueueIndex(null);
         setIsRunning(false);
       });
-
-      return () => {
-        unlistenProgress();
-        unlistenLog();
-        unlistenSpeed();
+      if (destroyed) {
         unlistenComplete();
-      };
+        return;
+      }
+      unlisteners.push(unlistenComplete);
+
+      const unlistenFailed = await listen<DownloadFailedEvent>("download_failed", (e) => {
+        setLogs((prev) => [...prev, `[ERROR] ${e.payload.error}`]);
+
+        const activeIndex = activeQueueIndexRef.current;
+        if (activeIndex !== null) {
+          setQueue((prev) =>
+            prev.map((q, i) => (i === activeIndex ? { ...q, status: "Failed" } : q)),
+          );
+        } else {
+          setQueue((prev) => {
+            const idx = prev.findIndex((q) => q.path === e.payload.path && q.status === "Active");
+            if (idx < 0) {
+              return prev;
+            }
+            return prev.map((q, i) => (i === idx ? { ...q, status: "Failed" } : q));
+          });
+        }
+
+        updateActiveQueueIndex(null);
+        setIsRunning(false);
+      });
+      if (destroyed) {
+        unlistenFailed();
+        return;
+      }
+      unlisteners.push(unlistenFailed);
     };
 
-    setupListeners();
+    void setupListeners();
+
+    return () => {
+      destroyed = true;
+      for (const unlisten of unlisteners) {
+        unlisten();
+      }
+    };
   }, []);
 
-  // Queue Processor
   useEffect(() => {
-    if (!isRunning && queue.length > 0) {
-      const pendingIndex = queue.findIndex(q => q.status === 'Pending');
-      if (pendingIndex > -1) {
-        processNextInQueue(pendingIndex);
-      }
+    if (isRunning || activeQueueIndex !== null || queue.length === 0) {
+      return;
     }
-  }, [isRunning, queue]);
+
+    const pendingIndex = queue.findIndex((q) => q.status === "Pending");
+    if (pendingIndex > -1) {
+      void processNextInQueue(pendingIndex);
+    }
+  }, [isRunning, queue, activeQueueIndex]);
 
   const processNextInQueue = async (index: number) => {
     const item = queue[index];
+    if (!item) {
+      return;
+    }
 
-    // Update queue state
-    setQueue(prev => prev.map((q, i) => i === index ? { ...q, status: 'Active' } : q));
+    updateActiveQueueIndex(index);
+    setQueue((prev) => prev.map((q, i) => (i === index ? { ...q, status: "Active" } : q)));
     setIsRunning(true);
-    setLogs([`[+] Engaging Automatic Extraction for: ${item.url}`]);
     setCircuits({});
     setSpeed("0.00");
+    setLogs((prev) => [...prev, `[+] Engaging Automatic Extraction for: ${item.url}`]);
 
     try {
       await invoke("initiate_download", {
@@ -103,16 +210,15 @@ function App() {
           path: item.path,
           connections: Number(connections),
           force_tor: forceTor,
-        }
+        },
       });
-      // The rust engine will emit "complete" which turns isRunning false and triggers the next item
-      setQueue(prev => prev.map((q, i) => i === index ? { ...q, status: 'Complete' } : q));
     } catch (err) {
-      setLogs((prev) => [...prev, `[ERROR] ${err}`]);
-      setQueue(prev => prev.map((q, i) => i === index ? { ...q, status: 'Failed' } : q));
-      setIsRunning(false); // trigger next
+      setLogs((prev) => [...prev, `[ERROR] ${String(err)}`]);
+      setQueue((prev) => prev.map((q, i) => (i === index ? { ...q, status: "Failed" } : q)));
+      updateActiveQueueIndex(null);
+      setIsRunning(false);
     }
-  }
+  };
 
   const handleBrowseDir = async () => {
     const selected = await open({
@@ -120,21 +226,46 @@ function App() {
       multiple: false,
       title: "Select Output Directory",
     });
-    if (selected && typeof selected === 'string') {
-      setOutputDir(selected + (selected.endsWith('/') || selected.endsWith('\\') ? '' : '/'));
+    if (selected && typeof selected === "string") {
+      setOutputDir(selected + (selected.endsWith("/") || selected.endsWith("\\") ? "" : "/"));
     }
   };
 
   const handleStart = () => {
-    if (!targetUrls || !outputDir) return;
-    const urls = targetUrls.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    const newQueue: QueuedItem[] = urls.map((u, i) => {
-      let filename = u.split('/').pop();
-      if (!filename) filename = `file_${i}.bin`;
+    if (!targetUrls || !outputDir) {
+      return;
+    }
 
-      const fullPath = outputDir.endsWith('/') ? `${outputDir}${filename}` : `${outputDir}/${filename}`;
-      return { url: u, path: fullPath, status: 'Pending' };
+    const urls = targetUrls
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    const newQueue: QueuedItem[] = urls.map((url, i) => {
+      let filename = url.split("/").pop();
+      if (!filename) {
+        filename = `file_${i}.bin`;
+      }
+      const fullPath = outputDir.endsWith("/") ? `${outputDir}${filename}` : `${outputDir}/${filename}`;
+      return { url, path: fullPath, status: "Pending" };
     });
+
+    const onionRequested = forceTor || urls.some((url) => url.includes(".onion"));
+    setTorStatus(
+      onionRequested
+        ? {
+            state: "starting",
+            message: "Queued Tor-enabled transfer. Waiting for engine kickoff...",
+            daemon_count: 0,
+          }
+        : {
+            state: "clearnet",
+            message: "Queued clearnet transfer. Tor will remain disabled.",
+            daemon_count: 0,
+          },
+    );
+
+    updateActiveQueueIndex(null);
     setQueue(newQueue);
   };
 
@@ -147,7 +278,16 @@ function App() {
 
       <header className="header">
         <div className="title">
-          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="url(#cyan-green-grad)" strokeWidth="2" strokeLinecap="square" style={{ filter: 'drop-shadow(0 0 10px rgba(184, 41, 255, 0.5))' }}>
+          <svg
+            width="40"
+            height="40"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="url(#cyan-green-grad)"
+            strokeWidth="2"
+            strokeLinecap="square"
+            style={{ filter: "drop-shadow(0 0 10px rgba(184, 41, 255, 0.5))" }}
+          >
             <defs>
               <linearGradient id="cyan-green-grad" x1="0" y1="0" x2="1" y2="1">
                 <stop offset="0%" stopColor="#00e5ff" />
@@ -158,7 +298,9 @@ function App() {
           </svg>
           <div className="title-text">
             <h1 className="cyber-glitch">LOKI ARIAFORGE</h1>
-            <div className="subtitle">((p)) ONLINE - SECURE <span className="pips">▮▮▮▮</span></div>
+            <div className="subtitle">
+              ((p)) ONLINE - SECURE <span className="pips">▮▮▮▮</span>
+            </div>
           </div>
         </div>
         <div className="header-controls">
@@ -168,7 +310,6 @@ function App() {
 
       <main className="dashboard">
         <div className="hud-layout">
-          {/* Left HUD Column */}
           <section className="left-panel">
             <div className="cyber-panel">
               <div className="panel-header">
@@ -180,39 +321,40 @@ function App() {
                   <label>SESSION ID</label>
                   <input type="text" value="0x7F41B" disabled />
                 </div>
-                <div className="input-row" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
-                  <label style={{ marginBottom: '0.5rem' }}>TARGET URL(S) - AUTO DETECT</label>
+                <div className="input-row" style={{ flexDirection: "column", alignItems: "flex-start" }}>
+                  <label style={{ marginBottom: "0.5rem" }}>TARGET URL(S) - AUTO DETECT</label>
                   <textarea
                     value={targetUrls}
                     onChange={(e) => setTargetUrls(e.target.value)}
                     placeholder="Provide 1 or 1,000 URLs here..."
                     disabled={isRunning}
                     rows={3}
-                    style={{ width: '100%', resize: 'vertical' }}
+                    style={{ width: "100%", resize: "vertical" }}
                   />
                 </div>
                 <div className="input-row">
                   <label>OUTPUT DIR</label>
                   <div className="input-with-btn">
                     <input type="text" value={outputDir} onChange={(e) => setOutputDir(e.target.value)} disabled={isRunning} />
-                    <button className="btn-browse" onClick={handleBrowseDir} disabled={isRunning}>...</button>
+                    <button className="btn-browse" onClick={handleBrowseDir} disabled={isRunning}>
+                      ...
+                    </button>
                   </div>
                 </div>
-
                 <div className="input-row">
                   <label>MULTIPLEX LIMIT</label>
                   <input
                     type="number"
                     value={connections}
                     onChange={(e) => setConnections(Number(e.target.value))}
-                    min="1" max="500"
+                    min="1"
+                    max="500"
                     disabled={isRunning}
-                    style={{ color: 'var(--success)' }}
+                    style={{ color: "var(--success)" }}
                   />
                 </div>
-
                 <div className="input-row checkbox-row">
-                  <label>TOR DAEMONS</label>
+                  <label>FORCE TOR</label>
                   <input
                     type="checkbox"
                     checked={forceTor}
@@ -220,17 +362,29 @@ function App() {
                     disabled={isRunning}
                   />
                 </div>
-
                 <div style={{ flex: 1 }}></div>
-
-                <button
-                  className={`btn-engage ${isRunning ? 'active' : ''}`}
-                  onClick={handleStart}
-                  disabled={isRunning || !targetUrls}
-                >
+                <button className={`btn-engage ${isRunning ? "active" : ""}`} onClick={handleStart} disabled={isRunning || !targetUrls}>
                   <span className="btn-text">ENGAGE GOVERNOR</span>
-                  <span className="btn-status">{isRunning ? 'ACTIVE' : 'STANDBY'}</span>
+                  <span className="btn-status">{isRunning ? "ACTIVE" : "STANDBY"}</span>
                 </button>
+              </div>
+            </div>
+
+            <div className="cyber-panel tor-panel">
+              <div className="panel-header">
+                <h2>TOR BOOTSTRAP STATUS</h2>
+                <span className={`tor-pill ${torStatus.state}`}>{torStatus.state.toUpperCase()}</span>
+              </div>
+              <div className="panel-content tor-content">
+                <div className="tor-row">
+                  <span>MODE</span>
+                  <strong>{forceTor ? "FORCED" : "AUTO"}</strong>
+                </div>
+                <div className="tor-row">
+                  <span>DAEMONS</span>
+                  <strong>{torStatus.daemon_count}</strong>
+                </div>
+                <div className="tor-msg">{torStatus.message}</div>
               </div>
             </div>
 
@@ -240,80 +394,94 @@ function App() {
                 <span className="close-btn">_ [] X</span>
               </div>
               <div className="panel-content terminal">
-                {logs.length === 0 && <span style={{ color: 'var(--text-muted)' }}>[SYSTEM] AWAITING COMMAND...</span>}
+                {logs.length === 0 && <span style={{ color: "var(--text-muted)" }}>[SYSTEM] AWAITING COMMAND...</span>}
                 {logs.map((log, i) => {
                   const timestamp = new Date().toISOString().substring(11, 19);
                   return (
-                    <span key={i} className={log.includes('[+]') || log.includes('Verified') ? 'success' : log.includes('[ERROR]') ? 'error' : 'highlight'}>
-                      <span style={{ color: 'var(--text-muted)', marginRight: '8px' }}>[{timestamp}]</span>
+                    <span key={i} className={log.includes("[+]") || log.includes("Verified") ? "success" : log.includes("[ERROR]") ? "error" : "highlight"}>
+                      <span style={{ color: "var(--text-muted)", marginRight: "8px" }}>[{timestamp}]</span>
                       {log}
                     </span>
-                  )
+                  );
                 })}
                 <div ref={logsEndRef} />
-                <span className="prompt">root@ariaforge:~# <span className="cursor">█</span></span>
+                <span className="prompt">
+                  root@ariaforge:~# <span className="cursor">█</span>
+                </span>
               </div>
             </div>
           </section>
 
-          {/* Right HUD Column */}
           <section className="right-panel">
             <div className="cyber-panel grid-panel">
               <div className="panel-header">
                 <h2>GEOGRAPHIC CIRCUIT NODES</h2>
                 <div className="header-stats">
-                  <span>THROUGHPUT: <strong style={{ color: 'var(--success)' }}>{speed} MB/s</strong></span>
-                  <span>TOTAL: <strong>{totalMB} MB</strong></span>
+                  <span>
+                    THROUGHPUT: <strong style={{ color: "var(--success)" }}>{speed} MB/s</strong>
+                  </span>
+                  <span>
+                    TOTAL: <strong>{totalMB} MB</strong>
+                  </span>
                 </div>
               </div>
               <div className="panel-content nodes-grid">
-                {Object.keys(circuits).length > 0 ? Array.from({ length: connections }).map((_, i) => {
-                  const circuit = circuits[i];
-                  if (!circuit) return null;
+                {Object.keys(circuits).length > 0 ? (
+                  Array.from({ length: connections }).map((_, i) => {
+                    const circuit = circuits[i];
+                    if (!circuit) {
+                      return null;
+                    }
 
-                  const progress = circuit.total > 0 ? (circuit.downloaded / circuit.total) * 100 : 0;
-                  const isDone = circuit.status === "Done";
+                    const progress = circuit.total > 0 ? (circuit.downloaded / circuit.total) * 100 : 0;
+                    const isDone = circuit.status === "Done";
+                    const locations = ["UK-NORD", "DE-BER", "JP-TKY", "US-NY", "RU-MSK", "NL-AMS"];
+                    const mockLoc = `${locations[i % locations.length]}-${(i + 1).toString().padStart(2, "0")}`;
 
-                  // Cyberpunk mock locations
-                  const locations = ["UK-NORD", "DE-BER", "JP-TKY", "US-NY", "RU-MSK", "NL-AMS"];
-                  const mockLoc = `${locations[i % locations.length]}-${(i + 1).toString().padStart(2, '0')}`;
-
-                  return (
-                    <div key={i} className="node-card">
-                      <div className="node-top">
-                        <span className="n-id">{mockLoc}</span>
-                        <span className={`n-state ${isDone ? 'done' : 'active'}`}>{isDone ? 'VERIFIED' : 'ACTIVE'}</span>
-                      </div>
-
-                      <div className="node-map-placeholder">
-                        {/* World map stylized placeholder */}
-                        <div className="map-dots">...:::...::....</div>
-                      </div>
-
-                      <div className="node-stats-row">
-                        <div className="stat-col">
-                          <span className="s-label">PROGRESS</span>
-                          <span className="s-val">{progress.toFixed(0)}%</span>
+                    return (
+                      <div key={i} className="node-card">
+                        <div className="node-top">
+                          <span className="n-id">{mockLoc}</span>
+                          <span className={`n-state ${isDone ? "done" : "active"}`}>{isDone ? "VERIFIED" : "ACTIVE"}</span>
                         </div>
-                        <div className="node-progress">
-                          <div className={`bar ${isDone ? 'done' : ''}`} style={{ width: `${Math.min(100, Math.max(0, progress))}%` }}></div>
-                        </div>
-                      </div>
 
-                      <div className="node-stats-row">
-                        <div className="stat-col">
-                          <span className="s-label">SPEED</span>
-                          <span className="s-val">{(circuit.main_speed_mbps || 0).toFixed(1)} MB/s</span>
+                        <div className="node-map-placeholder">
+                          <div className="map-dots">...:::...::....</div>
                         </div>
-                        <div className="stat-col right">
-                          <span className="s-label">STATUS</span>
-                          <span className={`s-val ${isDone ? 'done' : 'stable'}`}>{isDone ? 'SECURE' : 'STABLE'}</span>
+
+                        <div className="node-stats-row">
+                          <div className="stat-col">
+                            <span className="s-label">PROGRESS</span>
+                            <span className="s-val">{progress.toFixed(0)}%</span>
+                          </div>
+                          <div className="node-progress">
+                            <div className={`bar ${isDone ? "done" : ""}`} style={{ width: `${Math.min(100, Math.max(0, progress))}%` }}></div>
+                          </div>
+                        </div>
+
+                        <div className="node-stats-row">
+                          <div className="stat-col">
+                            <span className="s-label">SPEED</span>
+                            <span className="s-val">{(circuit.main_speed_mbps || 0).toFixed(1)} MB/s</span>
+                          </div>
+                          <div className="stat-col right">
+                            <span className="s-label">STATUS</span>
+                            <span className={`s-val ${isDone ? "done" : "stable"}`}>{isDone ? "SECURE" : "STABLE"}</span>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  );
-                }) : (
-                  <div style={{ padding: '2rem', color: 'var(--text-muted)', textAlign: 'center', gridColumn: '1 / -1', fontFamily: 'Orbitron' }}>
+                    );
+                  })
+                ) : (
+                  <div
+                    style={{
+                      padding: "2rem",
+                      color: "var(--text-muted)",
+                      textAlign: "center",
+                      gridColumn: "1 / -1",
+                      fontFamily: "Orbitron",
+                    }}
+                  >
                     AWAITING CONNECTION TARGET...
                   </div>
                 )}
@@ -327,7 +495,7 @@ function App() {
                 </div>
                 <div className="panel-content queue-list">
                   {queue.map((q, idx) => (
-                    <div key={idx} className={`q-item ${q.status.toLowerCase()}`}>
+                    <div key={idx} className={`q-item ${q.status.toLowerCase()} ${idx === activeQueueIndex ? "focus" : ""}`}>
                       <span className="q-url">{q.url}</span>
                       <span className={`q-status ${q.status.toLowerCase()}`}>{q.status}</span>
                     </div>
