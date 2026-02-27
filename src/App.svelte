@@ -100,11 +100,37 @@
     logsContainer.scrollTop = logsContainer.scrollHeight;
   }
 
+  function sanitizeDialogPath(path: string): string {
+    const trimmed = path.trim();
+    if (!trimmed) {
+      return trimmed;
+    }
+
+    if (trimmed.startsWith("file://")) {
+      try {
+        const parsed = decodeURIComponent(new URL(trimmed).pathname);
+        if (/^\/[A-Za-z]:\//.test(parsed)) {
+          return parsed.slice(1);
+        }
+        return parsed;
+      } catch {
+        return trimmed;
+      }
+    }
+
+    return trimmed;
+  }
+
   function normalizeOutputDirectory(path: string): string {
-    if (!path.trim()) {
+    const sanitized = sanitizeDialogPath(path);
+    if (!sanitized) {
       return "/tmp/loki_out/";
     }
-    return path.endsWith("/") || path.endsWith("\\") ? path : `${path}/`;
+    if (sanitized.endsWith("/") || sanitized.endsWith("\\")) {
+      return sanitized;
+    }
+    const separator = sanitized.includes("\\") ? "\\" : "/";
+    return `${sanitized}${separator}`;
   }
 
   function addLog(message: string): void {
@@ -199,14 +225,29 @@
   }
 
   async function browseDirectory(): Promise<void> {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: "Select output directory",
-    });
-    if (selected && typeof selected === "string") {
-      outputDir = normalizeOutputDirectory(selected);
-      await refreshArtifacts();
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Select output directory",
+      });
+
+      let chosen: string | null = null;
+      if (typeof selected === "string") {
+        chosen = selected;
+      } else if (Array.isArray(selected) && selected.length > 0) {
+        chosen = selected[0] ?? null;
+      }
+
+      if (chosen) {
+        outputDir = normalizeOutputDirectory(chosen);
+        addLog(`[+] Output directory set: ${outputDir}`);
+        await refreshArtifacts();
+      } else {
+        addLog("[*] Output directory selection cancelled.");
+      }
+    } catch (error) {
+      addLog(`[ERROR] Failed to open directory dialog: ${String(error)}`);
     }
   }
 
