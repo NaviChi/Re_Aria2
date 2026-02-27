@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "loki_ariaforge_ui",
+  "productName": "Loki AriaForge UI",
   "version": "0.1.0",
-  "identifier": "com.navi.loki_ariaforge_ui",
+  "identifier": "com.navi.lokiariaforgeui",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "loki_ariaforge_ui",
+        "title": "Loki AriaForge UI",
         "width": 800,
         "height": 600
       }
