@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
-use tauri::{AppHandle, Emitter, command};
+use tauri::{command, AppHandle, Emitter, RunEvent};
 
 mod downloader;
 
@@ -49,7 +49,10 @@ fn normalize_extension(path: &Path) -> Option<String> {
 }
 
 #[command]
-fn list_output_tree(root: String, max_entries: Option<usize>) -> Result<Vec<FileTreeEntry>, String> {
+fn list_output_tree(
+    root: String,
+    max_entries: Option<usize>,
+) -> Result<Vec<FileTreeEntry>, String> {
     let root_path = PathBuf::from(root);
     if !root_path.exists() {
         return Ok(Vec::new());
@@ -64,29 +67,38 @@ fn list_output_tree(root: String, max_entries: Option<usize>) -> Result<Vec<File
     let mut entries: Vec<FileTreeEntry> = Vec::with_capacity(entry_limit);
 
     while let Some((current_dir, depth)) = stack.pop() {
-        let iter = fs::read_dir(&current_dir)
-            .map_err(|err| format!("failed to read directory '{}': {err}", current_dir.display()))?;
+        let iter = fs::read_dir(&current_dir).map_err(|err| {
+            format!(
+                "failed to read directory '{}': {err}",
+                current_dir.display()
+            )
+        })?;
 
         let mut children: Vec<(PathBuf, bool)> = Vec::new();
         for child in iter {
             let child = child.map_err(|err| format!("failed to read directory entry: {err}"))?;
             let path = child.path();
-            let is_dir = child
-                .file_type()
-                .map(|kind| kind.is_dir())
-                .unwrap_or(false);
+            let is_dir = child.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
             children.push((path, is_dir));
         }
 
-        children.sort_by(|(a_path, a_is_dir), (b_path, b_is_dir)| match (*a_is_dir, *b_is_dir) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => {
-                let a_name = a_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                let b_name = b_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                a_name.cmp(b_name)
-            }
-        });
+        children.sort_by(
+            |(a_path, a_is_dir), (b_path, b_is_dir)| match (*a_is_dir, *b_is_dir) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                _ => {
+                    let a_name = a_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    let b_name = b_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    a_name.cmp(b_name)
+                }
+            },
+        );
 
         for (path, is_dir) in children {
             if entries.len() >= entry_limit {
@@ -141,7 +153,10 @@ fn list_output_tree(root: String, max_entries: Option<usize>) -> Result<Vec<File
 }
 
 #[command]
-fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<FilePreviewResponse, String> {
+fn read_file_preview(
+    path: String,
+    max_bytes: Option<usize>,
+) -> Result<FilePreviewResponse, String> {
     let limit = max_bytes.unwrap_or(8192).clamp(512, 65536);
     let bytes = fs::read(&path).map_err(|err| format!("failed to read file '{}': {err}", path))?;
     let sampled = bytes.len().min(limit);
@@ -151,7 +166,8 @@ fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<FilePrevi
         .iter()
         .filter(|byte| byte.is_ascii_graphic() || matches!(**byte, b' ' | b'\n' | b'\r' | b'\t'))
         .count();
-    let binary_like = sampled > 0 && printable_count.saturating_mul(100) < sampled.saturating_mul(70);
+    let binary_like =
+        sampled > 0 && printable_count.saturating_mul(100) < sampled.saturating_mul(70);
 
     let (kind, content) = if binary_like {
         (
@@ -162,7 +178,10 @@ fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<FilePrevi
             ),
         )
     } else {
-        ("text".to_string(), String::from_utf8_lossy(slice).to_string())
+        (
+            "text".to_string(),
+            String::from_utf8_lossy(slice).to_string(),
+        )
     };
 
     Ok(FilePreviewResponse {
@@ -175,43 +194,111 @@ fn read_file_preview(path: String, max_bytes: Option<usize>) -> Result<FilePrevi
 
 #[command]
 async fn initiate_download(app: AppHandle, args: DownloadArgs) -> Result<(), String> {
-    app.emit("log", format!("Initiating extraction for: {}", args.url)).unwrap();
-    
-    // Spawn in background
+    let control = downloader::activate_download_control()
+        .ok_or_else(|| "A download is already active.".to_string())?;
+
+    let DownloadArgs {
+        url,
+        path,
+        connections,
+        force_tor,
+    } = args;
+
+    app.emit("log", format!("Initiating extraction for: {url}"))
+        .ok();
+
     let app_clone = app.clone();
-    let target_url = args.url.clone();
-    let target_path = args.path.clone();
+    let fail_url = url.clone();
+    let fail_path = path.clone();
+
     tokio::spawn(async move {
-        if let Err(e) = downloader::start_download(
+        let result = downloader::start_download(
             app_clone.clone(),
-            args.url,
-            args.path,
-            args.connections,
-            args.force_tor,
-        ).await {
-            let err = e.to_string();
-            let _ = app_clone.emit("log", format!("[ERROR] {}", err));
-            let _ = app_clone.emit("download_failed", DownloadFailedEvent {
-                url: target_url,
-                path: target_path,
-                error: err,
-            });
+            url,
+            path,
+            connections,
+            force_tor,
+            control,
+        )
+        .await;
+
+        downloader::clear_download_control();
+
+        if let Err(err) = result {
+            let message = err.to_string();
+            let _ = app_clone.emit("log", format!("[ERROR] {message}"));
+            let _ = app_clone.emit(
+                "download_failed",
+                DownloadFailedEvent {
+                    url: fail_url,
+                    path: fail_path,
+                    error: message,
+                },
+            );
         }
     });
-    
+
     Ok(())
+}
+
+#[command]
+fn pause_active_download(app: AppHandle) -> Result<bool, String> {
+    let paused = downloader::request_pause();
+    if paused {
+        let _ = app.emit(
+            "log",
+            "[*] Pause requested for active download.".to_string(),
+        );
+    }
+    Ok(paused)
+}
+
+#[command]
+fn stop_active_download(app: AppHandle) -> Result<bool, String> {
+    let stopped = downloader::request_stop();
+    if stopped {
+        let _ = app.emit("log", "[*] Stop requested for active download.".to_string());
+    }
+    Ok(stopped)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    downloader::cleanup_stale_tor_daemons();
+
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            downloader::cleanup_stale_tor_daemons();
+            let _ = app
+                .handle()
+                .emit("log", "[*] Startup Tor cleanup sweep complete.".to_string());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             initiate_download,
+            pause_active_download,
+            stop_active_download,
             list_output_tree,
             read_file_preview
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| match event {
+        RunEvent::ExitRequested { .. } | RunEvent::Exit => {
+            let _ = downloader::request_stop();
+            downloader::cleanup_stale_tor_daemons();
+            let _ = app_handle.emit(
+                "tor_status",
+                downloader::TorStatusEvent {
+                    state: "stopped".to_string(),
+                    message: "Tor cleanup complete on exit.".to_string(),
+                    daemon_count: 0,
+                },
+            );
+        }
+        _ => {}
+    });
 }

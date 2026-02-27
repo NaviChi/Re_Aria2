@@ -4,7 +4,7 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-  type QueueStatus = "Pending" | "Active" | "Complete" | "Failed";
+  type QueueStatus = "Pending" | "Active" | "Complete" | "Failed" | "Paused" | "Stopped";
 
   interface ProgressEvent {
     id: number;
@@ -30,6 +30,12 @@
     url: string;
     path: string;
     error: string;
+  }
+
+  interface DownloadInterruptedEvent {
+    url: string;
+    path: string;
+    reason: string;
   }
 
   interface TorStatusEvent {
@@ -63,6 +69,7 @@
   let connections = 120;
   let forceTor = false;
   let isRunning = false;
+  let queuePaused = false;
   let queueDispatchLock = false;
   let speedMbps = 0;
   let logs: string[] = [];
@@ -89,10 +96,31 @@
   $: circuitList = Object.values(circuits).sort((a, b) => a.id - b.id);
   $: totalBytes = circuitList.reduce((sum, entry) => sum + entry.downloaded, 0);
   $: totalMb = (totalBytes / 1048576).toFixed(2);
-  $: activeCircuits = circuitList.filter((entry) => entry.status !== "Done").length;
+  $: activeCircuitEntries = circuitList.filter((entry) => entry.status !== "Done");
+  $: runningCircuitCount = activeCircuitEntries.length;
+  $: averageCircuitSpeed =
+    runningCircuitCount > 0
+      ? activeCircuitEntries.reduce((sum, entry) => sum + entry.main_speed_mbps, 0) / runningCircuitCount
+      : 0;
+  $: minCircuitSpeed =
+    runningCircuitCount > 0
+      ? Math.min(...activeCircuitEntries.map((entry) => entry.main_speed_mbps))
+      : 0;
+  $: maxCircuitSpeed =
+    runningCircuitCount > 0
+      ? Math.max(...activeCircuitEntries.map((entry) => entry.main_speed_mbps))
+      : 0;
+
   $: completedQueue = queue.filter((entry) => entry.status === "Complete").length;
   $: failedQueue = queue.filter((entry) => entry.status === "Failed").length;
-  $: queueProgress = queue.length > 0 ? Math.round(((completedQueue + failedQueue) / queue.length) * 100) : 0;
+  $: stoppedQueue = queue.filter((entry) => entry.status === "Stopped").length;
+  $: pausedQueue = queue.filter((entry) => entry.status === "Paused").length;
+  $: terminalQueueCount = completedQueue + failedQueue + stoppedQueue;
+  $: queueProgress = queue.length > 0 ? Math.round((terminalQueueCount / queue.length) * 100) : 0;
+  $: hasQueuedWork = queue.some(
+    (entry) => entry.status === "Pending" || entry.status === "Active" || entry.status === "Paused",
+  );
+
   $: selectedImageSrc =
     selectedEntry && !selectedEntry.is_dir && isImageFile(selectedEntry) ? convertFileSrc(selectedEntry.path) : "";
 
@@ -167,6 +195,12 @@
     }
     if (status === "Active") {
       return "bg-cyan-500/15 text-cyan-300 ring-cyan-400/40 pulse-line";
+    }
+    if (status === "Paused") {
+      return "bg-amber-500/15 text-amber-300 ring-amber-400/40";
+    }
+    if (status === "Stopped") {
+      return "bg-slate-500/20 text-slate-200 ring-slate-400/40";
     }
     if (status === "Failed") {
       return "bg-rose-500/15 text-rose-300 ring-rose-400/40";
@@ -283,6 +317,7 @@
 
     outputDir = normalizeOutputDirectory(outputDir);
     setTorIntent(urls);
+    queuePaused = false;
     queue = urls.map((urlValue, index) => {
       const filename = deriveFilename(urlValue, index);
       return {
@@ -300,6 +335,14 @@
     void startNextPending();
   }
 
+  async function launchOrResume(): Promise<void> {
+    if (queuePaused) {
+      await resumeQueue();
+      return;
+    }
+    await engageQueue();
+  }
+
   function markQueueStatus(index: number, status: QueueStatus): void {
     queue = queue.map((entry, i) => (i === index ? { ...entry, status } : entry));
   }
@@ -311,8 +354,66 @@
     }
   }
 
+  async function pauseQueue(): Promise<void> {
+    if (!isRunning) {
+      return;
+    }
+
+    queuePaused = true;
+    try {
+      const accepted = await invoke<boolean>("pause_active_download");
+      if (!accepted) {
+        queuePaused = false;
+        addLog("[-] No active download available to pause.");
+      }
+    } catch (error) {
+      queuePaused = false;
+      addLog(`[ERROR] Pause request failed: ${String(error)}`);
+    }
+  }
+
+  async function resumeQueue(): Promise<void> {
+    queuePaused = false;
+    queue = queue.map((entry) => (entry.status === "Paused" ? { ...entry, status: "Pending" } : entry));
+    addLog("[*] Queue resumed.");
+    void startNextPending();
+  }
+
+  async function stopQueue(): Promise<void> {
+    queuePaused = false;
+    queue = queue.map((entry) =>
+      entry.status === "Pending" || entry.status === "Paused" ? { ...entry, status: "Stopped" } : entry,
+    );
+
+    if (isRunning) {
+      try {
+        const accepted = await invoke<boolean>("stop_active_download");
+        if (!accepted) {
+          addLog("[-] No active download available to stop.");
+          if (activeQueueIndex !== null) {
+            markQueueStatus(activeQueueIndex, "Stopped");
+            activeQueueIndex = null;
+          }
+          isRunning = false;
+          speedMbps = 0;
+          circuits = {};
+        }
+      } catch (error) {
+        addLog(`[ERROR] Stop request failed: ${String(error)}`);
+      }
+    } else {
+      if (activeQueueIndex !== null) {
+        markQueueStatus(activeQueueIndex, "Stopped");
+      }
+      activeQueueIndex = null;
+      speedMbps = 0;
+      circuits = {};
+      addLog("[*] Queue stopped.");
+    }
+  }
+
   async function startNextPending(): Promise<void> {
-    if (isRunning || queueDispatchLock) {
+    if (isRunning || queueDispatchLock || queuePaused) {
       return;
     }
 
@@ -348,7 +449,7 @@
       isRunning = false;
     } finally {
       queueDispatchLock = false;
-      if (!isRunning) {
+      if (!isRunning && !queuePaused) {
         void startNextPending();
       }
     }
@@ -452,14 +553,49 @@
 
         activeQueueIndex = null;
         isRunning = false;
+        speedMbps = 0;
         void refreshArtifacts();
-        void startNextPending();
+        if (!queuePaused) {
+          void startNextPending();
+        }
       });
       if (disposed) {
         completeUnlisten();
         return;
       }
       unlisteners.push(completeUnlisten);
+
+      const interruptedUnlisten = await listen<DownloadInterruptedEvent>("download_interrupted", (event) => {
+        const reason = event.payload.reason.trim().toLowerCase();
+        const paused = reason === "paused";
+
+        if (activeQueueIndex !== null) {
+          markQueueStatus(activeQueueIndex, paused ? "Paused" : "Stopped");
+        } else {
+          markByPath(event.payload.path, paused ? "Paused" : "Stopped");
+        }
+
+        if (paused) {
+          queuePaused = true;
+          addLog(`[*] Paused: ${event.payload.path}`);
+        } else {
+          queuePaused = false;
+          queue = queue.map((entry) =>
+            entry.status === "Pending" || entry.status === "Paused" ? { ...entry, status: "Stopped" } : entry,
+          );
+          addLog(`[*] Stopped: ${event.payload.path}`);
+        }
+
+        activeQueueIndex = null;
+        isRunning = false;
+        speedMbps = 0;
+        circuits = {};
+      });
+      if (disposed) {
+        interruptedUnlisten();
+        return;
+      }
+      unlisteners.push(interruptedUnlisten);
 
       const failureUnlisten = await listen<DownloadFailedEvent>("download_failed", (event) => {
         addLog(`[ERROR] ${event.payload.error}`);
@@ -468,9 +604,13 @@
         } else {
           markByPath(event.payload.path, "Failed");
         }
+
         activeQueueIndex = null;
         isRunning = false;
-        void startNextPending();
+        speedMbps = 0;
+        if (!queuePaused) {
+          void startNextPending();
+        }
       });
       if (disposed) {
         failureUnlisten();
@@ -492,7 +632,7 @@
   });
 </script>
 
-<div class="relative min-h-screen overflow-hidden bg-slate-950 text-slate-100">
+<div class="relative h-screen overflow-x-auto overflow-y-hidden bg-slate-950 text-slate-100">
   <div class="pointer-events-none absolute inset-0">
     <div class="absolute -left-28 -top-28 h-72 w-72 rounded-full bg-cyan-400/20 blur-3xl"></div>
     <div class="absolute -right-24 top-32 h-72 w-72 rounded-full bg-violet-500/20 blur-3xl"></div>
@@ -500,19 +640,17 @@
     <div class="radar-grid absolute inset-0 opacity-35"></div>
   </div>
 
-  <main class="relative mx-auto max-w-[1800px] space-y-6 p-4 md:p-6 lg:p-8">
+  <main class="relative mx-auto h-screen min-w-[1540px] max-w-none space-y-6 p-4 lg:p-6">
     <header class="glass-card rounded-3xl px-6 py-5">
-      <div class="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+      <div class="flex items-center justify-between gap-5">
         <div class="space-y-2">
           <div class="font-display text-xs uppercase tracking-[0.32em] text-cyan-300/80">Tauri v2 Native Rust Engine</div>
-          <h1 class="font-display text-3xl font-bold tracking-[0.12em] text-slate-50 md:text-4xl">
-            LOKI ARIAFORGE COMMAND CONSOLE
-          </h1>
+          <h1 class="font-display text-4xl font-bold tracking-[0.12em] text-slate-50">LOKI ARIAFORGE COMMAND CONSOLE</h1>
           <p class="max-w-3xl text-sm text-slate-300/90">
             Multi-connection acquisition cockpit with dark-web routing controls, live circuit telemetry, and visual artifact explorer.
           </p>
         </div>
-        <div class="flex flex-wrap items-center gap-3">
+        <div class="flex items-center gap-3">
           <button
             class="rounded-xl bg-cyan-400/20 px-4 py-2 font-display text-xs uppercase tracking-[0.15em] text-cyan-200 ring-1 ring-cyan-300/40 transition hover:bg-cyan-300/30"
             on:click={refreshArtifacts}
@@ -527,8 +665,8 @@
       </div>
     </header>
 
-    <section class="grid gap-6 xl:grid-cols-[380px_minmax(0,1fr)_430px]">
-      <div class="space-y-6">
+    <section class="grid h-[calc(100vh-220px)] min-h-[760px] grid-cols-[380px_minmax(700px,1fr)_430px] gap-6">
+      <div class="flex min-h-0 flex-col gap-6">
         <article class="glass-card rounded-3xl p-5">
           <div class="mb-5 flex items-center justify-between">
             <h2 class="font-display text-sm uppercase tracking-[0.16em] text-slate-100">Mission Controls</h2>
@@ -543,7 +681,7 @@
                 rows="5"
                 class="font-mono-ui w-full rounded-2xl border border-slate-500/40 bg-slate-900/70 px-3 py-2 text-sm text-slate-100 outline-none ring-0 transition focus:border-cyan-400/60 focus:shadow-[0_0_0_1px_rgba(34,211,238,0.45)]"
                 placeholder="https://example.com/archive.tar.gz&#10;http://target.onion/pack.7z"
-                disabled={isRunning}
+                disabled={isRunning || queuePaused}
               ></textarea>
             </label>
 
@@ -553,12 +691,12 @@
                 <input
                   bind:value={outputDir}
                   class="font-mono-ui min-w-0 flex-1 rounded-2xl border border-slate-500/40 bg-slate-900/70 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-400/60 focus:shadow-[0_0_0_1px_rgba(34,211,238,0.45)]"
-                  disabled={isRunning}
+                  disabled={isRunning || queuePaused}
                 />
                 <button
-                  class="rounded-2xl bg-slate-800 px-3 text-xs font-semibold text-cyan-200 ring-1 ring-cyan-300/40 transition hover:bg-slate-700"
+                  class="rounded-2xl bg-slate-800 px-3 text-xs font-semibold text-cyan-200 ring-1 ring-cyan-300/40 transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-45"
                   on:click={browseDirectory}
-                  disabled={isRunning}
+                  disabled={isRunning || queuePaused}
                   type="button"
                 >
                   Browse
@@ -566,7 +704,7 @@
               </div>
             </label>
 
-            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div class="grid grid-cols-2 gap-3">
               <label class="space-y-2 text-xs uppercase tracking-[0.12em] text-slate-300">
                 Connections
                 <input
@@ -575,7 +713,7 @@
                   min="1"
                   max="500"
                   class="font-mono-ui w-full rounded-2xl border border-slate-500/40 bg-slate-900/70 px-3 py-2 text-sm text-cyan-200 outline-none transition focus:border-cyan-400/60"
-                  disabled={isRunning}
+                  disabled={isRunning || queuePaused}
                 />
               </label>
               <label class="space-y-2 text-xs uppercase tracking-[0.12em] text-slate-300">
@@ -587,7 +725,7 @@
                       : "bg-slate-900/70 text-slate-300 ring-slate-500/40 hover:ring-cyan-300/40"
                   }`}
                   on:click={() => (forceTor = !forceTor)}
-                  disabled={isRunning}
+                  disabled={isRunning || queuePaused}
                   type="button"
                 >
                   {forceTor ? "Forced Tor" : "Auto Detect"}
@@ -599,18 +737,39 @@
               class={`w-full rounded-2xl px-4 py-3 font-display text-sm uppercase tracking-[0.14em] ring-1 transition ${
                 isRunning
                   ? "cursor-not-allowed bg-slate-700/60 text-slate-400 ring-slate-500/40"
-                  : "bg-gradient-to-r from-cyan-500/30 to-violet-500/30 text-cyan-100 ring-cyan-300/60 hover:from-cyan-400/40 hover:to-violet-400/40"
+                  : queuePaused
+                    ? "bg-amber-500/20 text-amber-100 ring-amber-300/60 hover:bg-amber-500/30"
+                    : "bg-gradient-to-r from-cyan-500/30 to-violet-500/30 text-cyan-100 ring-cyan-300/60 hover:from-cyan-400/40 hover:to-violet-400/40"
               }`}
-              on:click={engageQueue}
+              on:click={launchOrResume}
               type="button"
               disabled={isRunning}
             >
-              {isRunning ? "Queue Running..." : "Launch Queue"}
+              {queuePaused ? "Resume Queue" : isRunning ? "Queue Running..." : "Launch Queue"}
             </button>
+
+            <div class="grid grid-cols-2 gap-3">
+              <button
+                class="rounded-2xl bg-amber-500/20 px-4 py-2 font-display text-xs uppercase tracking-[0.12em] text-amber-200 ring-1 ring-amber-300/50 transition hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+                on:click={pauseQueue}
+                disabled={!isRunning}
+                type="button"
+              >
+                Pause
+              </button>
+              <button
+                class="rounded-2xl bg-rose-500/20 px-4 py-2 font-display text-xs uppercase tracking-[0.12em] text-rose-200 ring-1 ring-rose-300/50 transition hover:bg-rose-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+                on:click={stopQueue}
+                disabled={!hasQueuedWork}
+                type="button"
+              >
+                Stop
+              </button>
+            </div>
           </div>
         </article>
 
-        <article class="glass-card rounded-3xl p-5">
+        <article class="glass-card min-h-0 flex flex-1 flex-col rounded-3xl p-5">
           <h3 class="font-display text-sm uppercase tracking-[0.16em] text-slate-100">Queue Timeline</h3>
           <div class="mt-3 h-2 overflow-hidden rounded-full bg-slate-700/60">
             <div
@@ -620,10 +779,10 @@
           </div>
           <div class="mt-2 flex items-center justify-between text-xs text-slate-300">
             <span>{queueProgress}% complete</span>
-            <span>{completedQueue} done / {failedQueue} failed / {queue.length} total</span>
+            <span>{completedQueue} done / {failedQueue} failed / {stoppedQueue} stopped / {pausedQueue} paused</span>
           </div>
 
-          <div class="scroll-clean mt-4 max-h-[360px] space-y-2 overflow-auto pr-1">
+          <div class="scroll-clean mt-4 min-h-0 flex-1 space-y-2 overflow-auto pr-1">
             {#if queue.length === 0}
               <div class="rounded-2xl border border-dashed border-slate-500/50 bg-slate-900/50 p-4 text-sm text-slate-400">
                 Queue is empty. Add targets and launch.
@@ -646,10 +805,10 @@
         </article>
       </div>
 
-      <div class="space-y-6">
+      <div class="flex min-h-0 flex-col gap-6">
         <article class="glass-card rounded-3xl p-5">
           <h2 class="font-display text-sm uppercase tracking-[0.16em] text-slate-100">Live Telemetry</h2>
-          <div class="mt-4 grid gap-3 sm:grid-cols-3">
+          <div class="mt-4 grid grid-cols-3 gap-3">
             <div class="rounded-2xl border border-cyan-400/20 bg-slate-900/65 p-3">
               <div class="text-xs uppercase tracking-[0.12em] text-slate-400">Throughput</div>
               <div class="mt-1 font-display text-2xl text-cyan-300">{speedMbps.toFixed(2)} MB/s</div>
@@ -659,8 +818,8 @@
               <div class="mt-1 font-display text-2xl text-violet-300">{totalMb} MB</div>
             </div>
             <div class="rounded-2xl border border-emerald-400/20 bg-slate-900/65 p-3">
-              <div class="text-xs uppercase tracking-[0.12em] text-slate-400">Active Circuits</div>
-              <div class="mt-1 font-display text-2xl text-emerald-300">{activeCircuits}</div>
+              <div class="text-xs uppercase tracking-[0.12em] text-slate-400">Running Circuits</div>
+              <div class="mt-1 font-display text-2xl text-emerald-300">{runningCircuitCount}</div>
             </div>
           </div>
 
@@ -680,57 +839,36 @@
 
         <article class="glass-card rounded-3xl p-5">
           <div class="mb-4 flex items-center justify-between">
-            <h2 class="font-display text-sm uppercase tracking-[0.16em] text-slate-100">Circuit Matrix</h2>
+            <h2 class="font-display text-sm uppercase tracking-[0.16em] text-slate-100">Circuit Metrics</h2>
             <div class="font-mono-ui text-xs text-slate-400">slots: {connections}</div>
           </div>
 
-          <div class="scroll-clean grid max-h-[430px] gap-3 overflow-auto pr-1 sm:grid-cols-2">
-            {#if circuitList.length === 0}
-              <div class="col-span-full rounded-2xl border border-dashed border-slate-500/50 bg-slate-900/50 p-6 text-center text-sm text-slate-400">
-                Awaiting active circuits...
-              </div>
-            {:else}
-              {#each circuitList as circuit (circuit.id)}
-                <div class="rounded-2xl border border-slate-600/60 bg-slate-900/60 p-3">
-                  <div class="flex items-center justify-between">
-                    <div class="font-display text-xs uppercase tracking-[0.12em] text-cyan-300">Circuit {circuit.id + 1}</div>
-                    <div class={`rounded-full px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] ${
-                      circuit.status === "Done" ? "bg-emerald-500/20 text-emerald-300" : "bg-cyan-500/20 text-cyan-300"
-                    }`}>
-                      {circuit.status}
-                    </div>
-                  </div>
-
-                  <div class="mt-2 text-xs text-slate-300">
-                    {formatBytes(circuit.downloaded)} / {formatBytes(circuit.total)}
-                  </div>
-
-                  <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-700/70">
-                    <div
-                      class="relative h-full overflow-hidden rounded-full bg-gradient-to-r from-cyan-400 to-sky-300 transition-all duration-300"
-                      style={`width: ${Math.min(100, circuit.total > 0 ? (circuit.downloaded / circuit.total) * 100 : 0)}%`}
-                    >
-                      {#if circuit.status !== "Done"}
-                        <div class="sweep absolute inset-y-0 w-10 bg-gradient-to-r from-transparent via-white/65 to-transparent"></div>
-                      {/if}
-                    </div>
-                  </div>
-
-                  <div class="mt-2 flex items-center justify-between text-xs text-slate-400">
-                    <span>rate: {circuit.main_speed_mbps.toFixed(2)} MB/s</span>
-                    <span>
-                      {circuit.total > 0 ? ((circuit.downloaded / circuit.total) * 100).toFixed(1) : "0.0"}%
-                    </span>
-                  </div>
-                </div>
-              {/each}
-            {/if}
+          <div class="grid grid-cols-2 gap-3">
+            <div class="rounded-2xl border border-cyan-400/20 bg-slate-900/60 p-3">
+              <div class="text-xs uppercase tracking-[0.12em] text-slate-400">Running</div>
+              <div class="mt-1 font-display text-2xl text-cyan-300">{runningCircuitCount}</div>
+            </div>
+            <div class="rounded-2xl border border-sky-400/20 bg-slate-900/60 p-3">
+              <div class="text-xs uppercase tracking-[0.12em] text-slate-400">Avg Circuit Speed</div>
+              <div class="mt-1 font-display text-2xl text-sky-300">{averageCircuitSpeed.toFixed(2)} MB/s</div>
+            </div>
+            <div class="rounded-2xl border border-emerald-400/20 bg-slate-900/60 p-3">
+              <div class="text-xs uppercase tracking-[0.12em] text-slate-400">Smallest Speed</div>
+              <div class="mt-1 font-display text-2xl text-emerald-300">{minCircuitSpeed.toFixed(2)} MB/s</div>
+            </div>
+            <div class="rounded-2xl border border-violet-400/20 bg-slate-900/60 p-3">
+              <div class="text-xs uppercase tracking-[0.12em] text-slate-400">Largest Speed</div>
+              <div class="mt-1 font-display text-2xl text-violet-300">{maxCircuitSpeed.toFixed(2)} MB/s</div>
+            </div>
           </div>
         </article>
 
-        <article class="glass-card rounded-3xl p-5">
+        <article class="glass-card min-h-0 flex flex-1 flex-col rounded-3xl p-5">
           <h2 class="font-display text-sm uppercase tracking-[0.16em] text-slate-100">Operational Log</h2>
-          <div bind:this={logsContainer} class="scroll-clean mt-4 h-52 overflow-auto rounded-2xl border border-slate-600/60 bg-slate-950/70 p-3 font-mono-ui text-[11px] leading-relaxed text-slate-300">
+          <div
+            bind:this={logsContainer}
+            class="scroll-clean mt-4 min-h-0 flex-1 overflow-auto rounded-2xl border border-slate-600/60 bg-slate-950/70 p-3 font-mono-ui text-[11px] leading-relaxed text-slate-300"
+          >
             {#if logs.length === 0}
               <div class="text-slate-500">[SYSTEM] Waiting for directives...</div>
             {:else}
@@ -742,8 +880,8 @@
         </article>
       </div>
 
-      <div class="space-y-6">
-        <article class="glass-card rounded-3xl p-5">
+      <div class="flex min-h-0 flex-col gap-6">
+        <article class="glass-card min-h-0 flex flex-1 flex-col rounded-3xl p-5">
           <div class="mb-4 flex items-center justify-between">
             <h2 class="font-display text-sm uppercase tracking-[0.16em] text-slate-100">Artifact Tree</h2>
             <button
@@ -756,7 +894,7 @@
           </div>
 
           <div class="mb-3 font-mono-ui text-[11px] text-slate-400">root: {outputDir}</div>
-          <div class="scroll-clean max-h-[370px] space-y-1 overflow-auto rounded-2xl border border-slate-600/60 bg-slate-950/60 p-2">
+          <div class="scroll-clean min-h-0 flex-1 space-y-1 overflow-auto rounded-2xl border border-slate-600/60 bg-slate-950/60 p-2">
             {#if treeLoading}
               <div class="p-3 text-sm text-slate-400">Scanning output directory...</div>
             {:else if treeError}
@@ -786,7 +924,7 @@
           </div>
         </article>
 
-        <article class="glass-card rounded-3xl p-5">
+        <article class="glass-card min-h-0 flex flex-1 flex-col rounded-3xl p-5">
           <h2 class="font-display text-sm uppercase tracking-[0.16em] text-slate-100">Preview</h2>
 
           {#if !selectedEntry}
@@ -794,13 +932,13 @@
               Select an artifact from the tree to inspect metadata or preview content.
             </div>
           {:else}
-            <div class="mt-4 space-y-3">
+            <div class="mt-4 min-h-0 flex-1 space-y-3">
               <div class="rounded-2xl border border-slate-600/60 bg-slate-950/60 p-3">
                 <div class="font-mono-ui text-xs text-cyan-200">{selectedEntry.relative}</div>
-                <div class="mt-2 grid grid-cols-1 gap-2 text-[11px] text-slate-400 sm:grid-cols-2">
+                <div class="mt-2 grid grid-cols-2 gap-2 text-[11px] text-slate-400">
                   <div>Type: {selectedEntry.is_dir ? "Directory" : selectedEntry.extension ?? "file"}</div>
                   <div>Size: {selectedEntry.is_dir ? "-" : formatBytes(selectedEntry.size)}</div>
-                  <div class="sm:col-span-2">Modified: {formatTimestamp(selectedEntry.modified)}</div>
+                  <div class="col-span-2">Modified: {formatTimestamp(selectedEntry.modified)}</div>
                 </div>
               </div>
 
@@ -809,19 +947,19 @@
                   Directory node selected. Choose a file for content preview.
                 </div>
               {:else if selectedImageSrc}
-                <div class="overflow-hidden rounded-2xl border border-slate-600/60 bg-slate-950/60 p-2">
-                  <img src={selectedImageSrc} alt={selectedEntry.name} class="max-h-[320px] w-full rounded-xl object-contain" />
+                <div class="min-h-0 flex-1 overflow-hidden rounded-2xl border border-slate-600/60 bg-slate-950/60 p-2">
+                  <img src={selectedImageSrc} alt={selectedEntry.name} class="h-full w-full rounded-xl object-contain" />
                 </div>
               {:else if previewLoading}
                 <div class="rounded-2xl border border-slate-600/60 bg-slate-950/60 p-4 text-sm text-slate-400">Loading preview...</div>
               {:else if previewError}
                 <div class="rounded-2xl border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">{previewError}</div>
               {:else if preview}
-                <div class="rounded-2xl border border-slate-600/60 bg-slate-950/75 p-3">
+                <div class="min-h-0 flex-1 rounded-2xl border border-slate-600/60 bg-slate-950/75 p-3">
                   <div class="mb-2 text-[11px] text-slate-400">
                     {preview.kind} preview ({preview.bytes_read} bytes{preview.truncated ? ", truncated" : ""})
                   </div>
-                  <pre class="scroll-clean max-h-[260px] overflow-auto whitespace-pre-wrap break-words font-mono-ui text-[11px] text-slate-200">{preview.content}</pre>
+                  <pre class="scroll-clean h-[calc(100%-28px)] overflow-auto whitespace-pre-wrap break-words font-mono-ui text-[11px] text-slate-200">{preview.content}</pre>
                 </div>
               {:else}
                 <div class="rounded-2xl border border-slate-600/60 bg-slate-950/60 p-4 text-sm text-slate-400">
