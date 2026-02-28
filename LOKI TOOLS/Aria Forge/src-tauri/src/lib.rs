@@ -15,6 +15,13 @@ pub struct DownloadArgs {
     force_tor: bool,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct BatchDownloadArgs {
+    files: Vec<downloader::BatchFileEntry>,
+    connections: usize,
+    force_tor: bool,
+}
+
 #[derive(Clone, Serialize)]
 pub struct DownloadFailedEvent {
     url: String,
@@ -242,6 +249,32 @@ async fn initiate_download(app: AppHandle, args: DownloadArgs) -> Result<(), Str
 }
 
 #[command]
+async fn initiate_batch_download(app: AppHandle, args: BatchDownloadArgs) -> Result<(), String> {
+    let control = downloader::activate_download_control()
+        .ok_or_else(|| "A download is already active.".to_string())?;
+
+    let BatchDownloadArgs { files, connections, force_tor } = args;
+    let file_count = files.len();
+
+    app.emit("log", format!("[*] Batch download: {} files", file_count)).ok();
+
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let result = downloader::start_batch_download(
+            app_clone.clone(), files, connections, force_tor, control,
+        ).await;
+
+        downloader::clear_download_control();
+
+        if let Err(err) = result {
+            let _ = app_clone.emit("log", format!("[ERROR] Batch: {}", err));
+        }
+    });
+
+    Ok(())
+}
+
+#[command]
 fn pause_active_download(app: AppHandle) -> Result<bool, String> {
     let paused = downloader::request_pause();
     if paused {
@@ -278,6 +311,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             initiate_download,
+            initiate_batch_download,
             pause_active_download,
             stop_active_download,
             list_output_tree,

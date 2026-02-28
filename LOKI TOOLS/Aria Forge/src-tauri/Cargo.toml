@@ -1,9 +1,10 @@
 [package]
 name = "aria_forge"
-version = "0.5.1"
+version = "0.6.0"
 description = "Aria Forge desktop client"
 authors = ["you"]
 edition = "2021"
+default-run = "aria_forge"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
