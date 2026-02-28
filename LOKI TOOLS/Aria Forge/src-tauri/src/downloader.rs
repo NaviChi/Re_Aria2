@@ -11,9 +11,40 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+pub fn get_tor_path(app: &AppHandle) -> Result<PathBuf> {
+    let mut path = app.path().resource_dir().map_err(|e| anyhow!("Failed to get resource dir: {e}"))?;
+    path.push("bin");
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    path.push("win_x64/tor/tor.exe");
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    path.push("mac_x64/tor/tor");
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    path.push("mac_aarch64/tor/tor");
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    path.push("linux_x64/tor/tor");
+
+    #[cfg(not(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )))]
+    path.push("unsupported_platform");
+
+    if !path.exists() {
+        return Err(anyhow!("Tor executable not found at {}", path.display()));
+    }
+
+    Ok(path)
+}
 
 const TOR_DATA_DIR_PREFIX: &str = "loki_tor_";
 const TOR_PID_FILE: &str = "loki_tor.pid";
@@ -390,7 +421,17 @@ pub async fn start_download(
             cleanup_tor_data_dir(&data_dir);
             fs::create_dir_all(&data_dir)?;
 
-            let child = Command::new("tor")
+            let tor_path = get_tor_path(&app)?;
+            let tor_dir = tor_path.parent().unwrap();
+            let mut cmd = Command::new(&tor_path);
+
+            #[cfg(target_os = "linux")]
+            cmd.env("LD_LIBRARY_PATH", tor_dir);
+
+            #[cfg(target_os = "macos")]
+            cmd.env("DYLD_LIBRARY_PATH", tor_dir);
+
+            let child = cmd
                 .arg("--SocksPort")
                 .arg(format!("{port} IsolateSOCKSAuth"))
                 .arg("--DataDirectory")

@@ -1,6 +1,6 @@
 [package]
 name = "aria_forge"
-version = "0.5.0"
+version = "0.5.1"
 description = "Aria Forge desktop client"
 authors = ["you"]
 edition = "2021"
